@@ -14,6 +14,10 @@ jobs:
             - name: Sync to CNB Repository
               uses: docker://tencentcom/git-sync
               env:
+                  # 注入 Git LFS 配置，消除锁定提示
+                  GIT_CONFIG_COUNT: "1"
+                  GIT_CONFIG_KEY_0: "lfs.https://cnb.cool/soucod-github/soucod/vscode.git/info/lfs.locksverify"
+                  GIT_CONFIG_VALUE_0: "true"
                   PLUGIN_TARGET_URL: "https://cnb.cool/soucod-github/soucod/vscode.git"
                   PLUGIN_AUTH_TYPE: "https"
                   PLUGIN_USERNAME: "cnb"
