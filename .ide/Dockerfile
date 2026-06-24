@@ -17,7 +17,7 @@ RUN curl -fsSL https://code-server.dev/install.sh | sh \
 # 安装 ssh 服务，用于支持 VSCode 等客户端通过 Remote-SSH 访问开发环境（也可按需安装其他软件）
 RUN dnf update -y && dnf install -y git wget unzip openssh-server epel-release curl vim unzip procps && dnf install -y atop btop htop iftop iotop cockpit
 # 业务安装
-RUN dnf install -y nodejs npm python && dnf groupinstall "Development Tools" -y &&  dnf install -y libX11-devel.x86_64 libxkbfile-devel.x86_64 libsecret-devel krb5-devel && dnf install -y fakeroot rpm
+RUN dnf install -y nodejs npm python && dnf groupinstall "Development Tools" -y &&  dnf install -y libX11-devel libxkbfile libsecret-devel krb5-devel && dnf install -y fakeroot rpm
 RUN ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && echo "Asia/Shanghai" > /etc/timezone
 RUN npm i -g pnpm
 
