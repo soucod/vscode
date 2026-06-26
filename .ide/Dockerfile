@@ -18,6 +18,10 @@ RUN curl -fsSL https://code-server.dev/install.sh | sh \
 RUN dnf update -y && dnf install -y git wget unzip openssh-server epel-release curl vim unzip procps && dnf install -y atop btop htop iftop iotop cockpit
 # 业务安装
 RUN dnf install -y nodejs npm python && dnf groupinstall "Development Tools" -y &&  dnf install -y libX11-devel libxkbfile libsecret-devel krb5-devel && dnf install -y fakeroot rpm
+
+alternatives --install /usr/bin/node node /usr/bin/node-24 240
+alternatives --install /usr/bin/npm npm /usr/bin/npm-24 240
+
 RUN ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && echo "Asia/Shanghai" > /etc/timezone
 RUN npm i -g pnpm
 
