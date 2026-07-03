@@ -4,7 +4,6 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { SequencerByKey } from '../../../base/common/async.js';
-import { Emitter, Event } from '../../../base/common/event.js';
 import { Disposable, DisposableMap, IReference, ReferenceCollection } from '../../../base/common/lifecycle.js';
 import { URI } from '../../../base/common/uri.js';
 import { buildBranchChangesetUri, buildSessionChangesetUri, buildUncommittedChangesetUri } from '../common/changesetUri.js';
@@ -14,6 +13,7 @@ import { DEFAULT_AGENT_HOST_WATCH_EXCLUDES, IAgentHostFileMonitorService } from 
 import { IAgentHostGitService } from '../common/agentHostGitService.js';
 import { AgentHostStateManager } from './agentHostStateManager.js';
 import { ILogService } from '../../log/common/log.js';
+import { IAgentHostGitStateService } from '../common/agentHostGitStateService.js';
 
 class WatchInterestReferenceCollection extends ReferenceCollection<string> {
 	constructor(
@@ -78,21 +78,13 @@ export class ChangesetFileMonitorCoordinator extends Disposable {
 	private readonly _watchAttachmentSequencer = new SequencerByKey<string>();
 	private readonly _activeTurnSequencer = new SequencerByKey<string>();
 
-	private readonly _onDidChangeSessionRoot = this._register(new Emitter<string>());
-	/**
-	 * Fires with a session URI string whenever an external file-system change
-	 * is detected on that session's repository root (and the session is not
-	 * mid-turn). Listeners use this to refresh state that depends on the
-	 * working tree / branch, e.g. the session git state.
-	 */
-	readonly onDidChangeSessionRoot: Event<string> = this._onDidChangeSessionRoot.event;
-
 	constructor(
 		private readonly _stateManager: AgentHostStateManager,
-		private readonly _configurationService: IAgentConfigurationService,
-		private readonly _fileMonitorService: IAgentHostFileMonitorService,
-		private readonly _gitService: IAgentHostGitService,
-		private readonly _logService: ILogService,
+		@IAgentConfigurationService private readonly _configurationService: IAgentConfigurationService,
+		@IAgentHostFileMonitorService private readonly _fileMonitorService: IAgentHostFileMonitorService,
+		@IAgentHostGitService private readonly _gitService: IAgentHostGitService,
+		@IAgentHostGitStateService private readonly _gitStateService: IAgentHostGitStateService,
+		@ILogService private readonly _logService: ILogService,
 	) {
 		super();
 	}
@@ -247,8 +239,14 @@ export class ChangesetFileMonitorCoordinator extends Disposable {
 		if (activeSessions.length === 0) {
 			return;
 		}
+
+		const workingDirectory = URI.parse(rootStr);
+
 		for (const session of activeSessions) {
-			this._onDidChangeSessionRoot.fire(session);
+			// Refresh the git state for each active session. If there are multiple
+			// sessions on the same root, trigger the git state refresh for each
+			// individual session as the git state refresh will be throttled downstream.
+			void this._gitStateService.refreshSessionGitState(session, workingDirectory);
 		}
 	}
 
