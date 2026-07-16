@@ -5,6 +5,7 @@
 
 import assert from 'assert';
 import { VSBuffer } from '../../../../base/common/buffer.js';
+import { timeout } from '../../../../base/common/async.js';
 import { Event } from '../../../../base/common/event.js';
 import { DisposableStore, toDisposable } from '../../../../base/common/lifecycle.js';
 import { Schemas } from '../../../../base/common/network.js';
@@ -22,9 +23,9 @@ import { buildDefaultChangesetCatalog } from '../../common/changesetUri.js';
 import { ISessionDataService } from '../../common/sessionDataService.js';
 import { SessionConfigKey } from '../../common/sessionConfigKeys.js';
 import type { RootConfigChangedAction } from '../../common/state/protocol/actions.js';
-import { ChangesSummary, ChatOriginKind, CustomizationType, SessionInputRequestKind } from '../../common/state/protocol/state.js';
-import { ActionType, ActionEnvelope, type ChatAction, type SessionAction } from '../../common/state/sessionActions.js';
-import { buildSubagentChatUri, buildChatUri, buildDefaultChatUri, CustomizationLoadStatus, MessageAttachmentKind, MessageKind, PendingMessageKind, ResponsePartKind, SessionInputResponseKind, SessionStatus, ToolCallConfirmationReason, ToolCallContributorKind, ToolCallStatus, ToolResultContentType, customizationId, type ClientPluginCustomization, type Customization, type PluginCustomization } from '../../common/state/sessionState.js';
+import { ChangesSummary, ChatOriginKind, CustomizationType, McpAuthRequiredReason, SessionInputRequestKind } from '../../common/state/protocol/state.js';
+import { ActionType, ActionEnvelope, type ChatAction, type INotification, type SessionAction } from '../../common/state/sessionActions.js';
+import { buildSubagentChatUri, buildChatUri, buildDefaultChatUri, ChatInteractivity, CustomizationLoadStatus, MessageAttachmentKind, MessageKind, PendingMessageKind, ResponsePartKind, SessionInputResponseKind, SessionLifecycle, SessionStatus, ToolCallConfirmationReason, ToolCallContributorKind, ToolCallStatus, ToolResultContentType, customizationId, type ClientPluginCustomization, type Customization, type PluginCustomization } from '../../common/state/sessionState.js';
 import { IProductService } from '../../../product/common/productService.js';
 import { ITelemetryService, TelemetryLevel } from '../../../telemetry/common/telemetry.js';
 import { NullTelemetryService } from '../../../telemetry/common/telemetryUtils.js';
@@ -36,10 +37,13 @@ import { IAgentHostChangesetService, StaticChangesetKind } from '../../common/ag
 import { IAgentHostGitService } from '../../common/agentHostGitService.js';
 import { AgentService } from '../../node/agentService.js';
 import { AgentSideEffects, IAgentSideEffectsOptions } from '../../node/agentSideEffects.js';
+import { AgentHostLocalTurns } from '../../node/agentHostLocalTurns.js';
+import { IAgentHostTerminalManager } from '../../node/agentHostTerminalManager.js';
 import { SessionDatabase } from '../../node/sessionDatabase.js';
 import { AgentHostStateManager } from '../../node/agentHostStateManager.js';
-import { createNoopGitService, createNullSessionDataService, createSessionDataService } from '../common/sessionTestHelpers.js';
+import { createNoopGitService, createNullSessionDataService, createSessionDataService, TestSessionDatabase } from '../common/sessionTestHelpers.js';
 import { MockAgent } from './mockAgent.js';
+import { TestAgentHostTerminalManager } from './testAgentHostTerminalManager.js';
 
 // ---- Tests ------------------------------------------------------------------
 
@@ -95,10 +99,11 @@ class FakeChangesetService implements IAgentHostChangesetService {
 function createTestSideEffects(
 	disposables: DisposableStore,
 	stateManager: AgentHostStateManager,
-	options: IAgentSideEffectsOptions,
+	options: Omit<IAgentSideEffectsOptions, 'localTurns'> & { localTurns?: AgentHostLocalTurns },
 	_gitService?: IAgentHostGitService,
 	telemetryService: ITelemetryService = NullTelemetryService,
 	changesets: IAgentHostChangesetService = new FakeChangesetService(),
+	terminalManager: IAgentHostTerminalManager = disposables.add(new TestAgentHostTerminalManager()),
 ): AgentSideEffects {
 	const logService = new NullLogService();
 	const configService = disposables.add(new AgentConfigurationService(stateManager, logService));
@@ -108,8 +113,14 @@ function createTestSideEffects(
 		[IAgentHostChangesetService, changesets],
 		[IAgentHostCheckpointService, NULL_CHECKPOINT_SERVICE],
 		[ITelemetryService, telemetryService],
+		[IAgentHostTerminalManager, terminalManager],
+		[ISessionDataService, options.sessionDataService],
 	), /*strict*/ true));
-	return disposables.add(instantiationService.createInstance(AgentSideEffects, stateManager, options));
+	const resolvedOptions: IAgentSideEffectsOptions = {
+		...options,
+		localTurns: options.localTurns ?? new AgentHostLocalTurns(options.sessionDataService, logService),
+	};
+	return disposables.add(instantiationService.createInstance(AgentSideEffects, stateManager, resolvedOptions));
 }
 
 class TestTelemetryService implements ITelemetryService {
@@ -162,7 +173,7 @@ suite('AgentSideEffects', () => {
 	}
 
 	function startTurn(turnId: string, channel = defaultChatUri): void {
-		stateManager.dispatchClientAction(channel, { type: ActionType.ChatTurnStarted, turnId, message: { text: 'hello', origin: { kind: MessageKind.User } } },
+		stateManager.dispatchClientAction(channel, { type: ActionType.ChatTurnStarted, turnId, startedAt: '2025-01-01T00:00:00.000Z', message: { text: 'hello', origin: { kind: MessageKind.User } } },
 			{ clientId: 'test', clientSeq: 1 },
 		);
 	}
@@ -256,6 +267,7 @@ suite('AgentSideEffects', () => {
 			const action: ChatAction = {
 				type: ActionType.ChatTurnStarted,
 				turnId: 'turn-1',
+				startedAt: '2025-01-01T00:00:00.000Z',
 				message: { text: 'hello world', origin: { kind: MessageKind.User } },
 			};
 			sideEffects.handleAction(defaultChatUri, action);
@@ -270,6 +282,7 @@ suite('AgentSideEffects', () => {
 			const action: ChatAction = {
 				type: ActionType.ChatTurnStarted,
 				turnId: 'turn-1',
+				startedAt: '2025-01-01T00:00:00.000Z',
 				message: { text: 'hello world', origin: { kind: MessageKind.User } },
 			};
 			sideEffects.handleAction(defaultChatUri, action, 'client-B');
@@ -301,6 +314,7 @@ suite('AgentSideEffects', () => {
 			sideEffects.handleAction(defaultChatUri, {
 				type: ActionType.ChatTurnStarted,
 				turnId: 'turn-1',
+				startedAt: '2025-01-01T00:00:00.000Z',
 				message: { text: 'hello world', origin: { kind: MessageKind.User }, attachments: [{ type: MessageAttachmentKind.Resource, uri: fileUri.toString(), label: 'direct.ts', displayKind: 'document' }] },
 			});
 
@@ -326,6 +340,7 @@ suite('AgentSideEffects', () => {
 			const action: ChatAction = {
 				type: ActionType.ChatTurnStarted,
 				turnId: 'turn-1',
+				startedAt: '2025-01-01T00:00:00.000Z',
 				message: { text: 'hello world', origin: { kind: MessageKind.User }, attachments: [{ type: MessageAttachmentKind.Resource, uri: fileUri.toString(), label: 'test.ts', displayKind: 'document' }] },
 			};
 
@@ -346,6 +361,7 @@ suite('AgentSideEffects', () => {
 			const action: ChatAction = {
 				type: ActionType.ChatTurnStarted,
 				turnId: 'turn-1',
+				startedAt: '2025-01-01T00:00:00.000Z',
 				message: {
 					text: 'hello world',
 					origin: { kind: MessageKind.User },
@@ -402,11 +418,177 @@ suite('AgentSideEffects', () => {
 			noAgentSideEffects.handleAction(defaultChatUri, {
 				type: ActionType.ChatTurnStarted,
 				turnId: 'turn-1',
+				startedAt: '2025-01-01T00:00:00.000Z',
 				message: { text: 'hello', origin: { kind: MessageKind.User } },
 			});
 
 			const errorAction = envelopes.find(e => e.action.type === ActionType.ChatError);
 			assert.ok(errorAction, 'should dispatch session/error');
+		});
+
+		test('rejects a turn on an archived session without calling the agent', () => {
+			setupSession();
+			stateManager.dispatchServerAction(sessionUri.toString(), { type: ActionType.SessionIsArchivedChanged, isArchived: true });
+
+			const envelopes: ActionEnvelope[] = [];
+			disposables.add(stateManager.onDidEmitEnvelope(e => envelopes.push(e)));
+
+			sideEffects.handleAction(defaultChatUri, {
+				type: ActionType.ChatTurnStarted,
+				startedAt: '2025-01-01T00:00:00.000Z',
+				turnId: 'turn-1',
+				message: { text: 'hello', origin: { kind: MessageKind.User } },
+			});
+
+			const errorAction = envelopes.find(e => e.action.type === ActionType.ChatError);
+			assert.ok(errorAction, 'should dispatch a chat error for an archived session');
+			assert.deepStrictEqual(agent.sendMessageCalls, []);
+		});
+
+		test('rejects a turn on a read-only chat without calling the agent', () => {
+			setupSession();
+			// A read-only peer chat (e.g. a subagent worker) on a non-archived
+			// session — enforcement keys off the chat's interactivity, not archived.
+			const readOnlyChat = buildChatUri(sessionUri, 'peer-ro');
+			stateManager.addChat(sessionUri.toString(), readOnlyChat, { interactivity: ChatInteractivity.ReadOnly });
+
+			const envelopes: ActionEnvelope[] = [];
+			disposables.add(stateManager.onDidEmitEnvelope(e => envelopes.push(e)));
+
+			sideEffects.handleAction(readOnlyChat, {
+				type: ActionType.ChatTurnStarted,
+				startedAt: '2025-01-01T00:00:00.000Z',
+				turnId: 'turn-1',
+				message: { text: 'hello', origin: { kind: MessageKind.User } },
+			});
+
+			const errorAction = envelopes.find(e => e.action.type === ActionType.ChatError);
+			assert.ok(errorAction, 'should dispatch a chat error for a read-only chat');
+			assert.deepStrictEqual(agent.sendMessageCalls, []);
+		});
+	});
+
+	// ---- handleAction: first-turn materialization failure ---------------
+
+	suite('handleAction — first-turn materialization failure', () => {
+		/**
+		 * Create a provisional (not-yet-materialized) session: no `SessionReady`
+		 * (so lifecycle stays `Creating`) and a deferred `SessionAdded` — mirroring
+		 * how the agent host creates a session whose worktree/SDK setup happens on
+		 * the first `sendMessage`.
+		 */
+		function setupProvisionalSession(): void {
+			stateManager.createSession({
+				resource: sessionUri.toString(),
+				provider: 'mock',
+				title: 'Test',
+				status: SessionStatus.Idle,
+				createdAt: new Date().toISOString(),
+				modifiedAt: new Date().toISOString(),
+			}, { emitNotification: false });
+		}
+
+		test('surfaces a failed provisional first turn as a terminal creation failure', async () => {
+			setupProvisionalSession();
+			agent.sendMessageError = new Error('git -c exited with code 128: fatal: invalid reference: main');
+
+			// Reduce the turn start (as the client would) so the chat has an
+			// active turn for the subsequent ChatError to terminate, then invoke
+			// the side effects that drive `sendMessage`.
+			const turnStarted = {
+				type: ActionType.ChatTurnStarted,
+				startedAt: '2025-01-01T00:00:00.000Z',
+				turnId: 'turn-1',
+				message: { text: 'hello', origin: { kind: MessageKind.User } },
+			} as const;
+			stateManager.dispatchClientAction(defaultChatUri, turnStarted, { clientId: 'test', clientSeq: 1 });
+
+			const envelopes: ActionEnvelope[] = [];
+			disposables.add(stateManager.onDidEmitEnvelope(e => envelopes.push(e)));
+			const notifications: INotification[] = [];
+			disposables.add(stateManager.onDidEmitNotification(n => notifications.push(n)));
+
+			sideEffects.handleAction(defaultChatUri, turnStarted);
+
+			// Wait for the async send rejection + catch handling to run.
+			await waitForState(stateManager, () => envelopes.some(e => e.action.type === ActionType.SessionCreationFailed) || undefined);
+
+			const sessionAdded = notifications.find(n => n.type === 'root/sessionAdded');
+			assert.deepStrictEqual({
+				chatError: envelopes.some(e => e.action.type === ActionType.ChatError),
+				creationFailed: envelopes.some(e => e.action.type === ActionType.SessionCreationFailed),
+				lifecycle: stateManager.getSessionState(sessionUri.toString())?.lifecycle,
+				sessionAddedWithError: !!sessionAdded && (sessionAdded.summary.status & SessionStatus.Error) === SessionStatus.Error,
+			}, {
+				chatError: true,
+				creationFailed: true,
+				lifecycle: SessionLifecycle.CreationFailed,
+				sessionAddedWithError: true,
+			});
+		});
+
+		test('surfaces a working directory resolution failure without calling the agent', async () => {
+			setupProvisionalSession();
+			const resolutionError = new Error('The isolated worktree could not be restored');
+			const resolvingSideEffects = createTestSideEffects(disposables, stateManager, {
+				getAgent: () => agent,
+				agents: agentList,
+				sessionDataService: {} as ISessionDataService,
+				resolveWorkingDirectoryBeforeSend: async () => { throw resolutionError; },
+				onTurnComplete: () => { },
+			});
+			const turnStarted = {
+				type: ActionType.ChatTurnStarted,
+				turnId: 'turn-1',
+				startedAt: '2025-01-01T00:00:00.000Z',
+				message: { text: 'hello', origin: { kind: MessageKind.User } },
+			} as const;
+			stateManager.dispatchClientAction(defaultChatUri, turnStarted, { clientId: 'test', clientSeq: 1 });
+
+			const envelopes: ActionEnvelope[] = [];
+			disposables.add(stateManager.onDidEmitEnvelope(e => envelopes.push(e)));
+			resolvingSideEffects.handleAction(defaultChatUri, turnStarted);
+
+			await waitForState(stateManager, () => envelopes.some(e => e.action.type === ActionType.SessionCreationFailed) || undefined);
+
+			assert.deepStrictEqual({
+				chatError: envelopes.some(e => e.action.type === ActionType.ChatError),
+				creationFailed: envelopes.some(e => e.action.type === ActionType.SessionCreationFailed),
+				lifecycle: stateManager.getSessionState(sessionUri.toString())?.lifecycle,
+				sendMessageCalls: agent.sendMessageCalls,
+			}, {
+				chatError: true,
+				creationFailed: true,
+				lifecycle: SessionLifecycle.CreationFailed,
+				sendMessageCalls: [],
+			});
+		});
+
+		test('does not fail creation when an already-ready session send rejects', async () => {
+			setupSession(); // dispatches SessionReady -> lifecycle Ready
+			agent.sendMessageError = new Error('transient send failure');
+
+			const envelopes: ActionEnvelope[] = [];
+			disposables.add(stateManager.onDidEmitEnvelope(e => envelopes.push(e)));
+
+			sideEffects.handleAction(defaultChatUri, {
+				type: ActionType.ChatTurnStarted,
+				startedAt: '2025-01-01T00:00:00.000Z',
+				turnId: 'turn-1',
+				message: { text: 'hello', origin: { kind: MessageKind.User } },
+			});
+
+			await waitForState(stateManager, () => envelopes.some(e => e.action.type === ActionType.ChatError) || undefined);
+
+			assert.deepStrictEqual({
+				chatError: envelopes.some(e => e.action.type === ActionType.ChatError),
+				creationFailed: envelopes.some(e => e.action.type === ActionType.SessionCreationFailed),
+				lifecycle: stateManager.getSessionState(sessionUri.toString())?.lifecycle,
+			}, {
+				chatError: true,
+				creationFailed: false,
+				lifecycle: SessionLifecycle.Ready,
+			});
 		});
 	});
 
@@ -432,6 +614,7 @@ suite('AgentSideEffects', () => {
 			const action: ChatAction = {
 				type: ActionType.ChatTurnStarted,
 				turnId: 'turn-1',
+				startedAt: '2025-01-01T00:00:00.000Z',
 				message: { text: '/rename Renamed Session', origin: { kind: MessageKind.User } },
 			};
 			// Mirror production: the reducer applies the turn, then side effects run.
@@ -454,6 +637,7 @@ suite('AgentSideEffects', () => {
 			const action: ChatAction = {
 				type: ActionType.ChatTurnStarted,
 				turnId: 'turn-1',
+				startedAt: '2025-01-01T00:00:00.000Z',
 				message: { text: '/rename', origin: { kind: MessageKind.User } },
 			};
 			stateManager.dispatchClientAction(defaultChatUri, action, { clientId: 'test', clientSeq: 1 });
@@ -472,6 +656,7 @@ suite('AgentSideEffects', () => {
 			const action: ChatAction = {
 				type: ActionType.ChatTurnStarted,
 				turnId: 'turn-1',
+				startedAt: '2025-01-01T00:00:00.000Z',
 				message: { text: '/renamed thing', origin: { kind: MessageKind.User } },
 			};
 			stateManager.dispatchClientAction(defaultChatUri, action, { clientId: 'test', clientSeq: 1 });
@@ -479,6 +664,211 @@ suite('AgentSideEffects', () => {
 			await new Promise(r => setTimeout(r, 10));
 
 			assert.deepStrictEqual(agent.sendMessageCalls, [{ session: URI.parse(sessionUri.toString()), chat: URI.parse(defaultChatUri), prompt: '/renamed thing', attachments: undefined }]);
+		});
+	});
+
+	// ---- handleAction: generic ! terminal command ------------------------
+
+	suite('handleAction — ! terminal command', () => {
+
+		function createBangSideEffects(terminalManager: TestAgentHostTerminalManager): AgentSideEffects {
+			return createTestSideEffects(disposables, stateManager, {
+				getAgent: () => agent,
+				agents: agentList,
+				sessionDataService: createNullSessionDataService(),
+				onTurnComplete: () => { },
+			}, undefined, undefined, undefined, terminalManager);
+		}
+
+		test('runs a ! message as a terminal command and completes the turn without calling the agent', async () => {
+			setupSession('file:///work');
+			const terminalManager = disposables.add(new TestAgentHostTerminalManager());
+			const bangSideEffects = createBangSideEffects(terminalManager);
+			const action: ChatAction = {
+				type: ActionType.ChatTurnStarted,
+				turnId: 'turn-1',
+				startedAt: '2025-01-01T00:00:00.000Z',
+				message: { text: '!echo hi', origin: { kind: MessageKind.User } },
+			};
+			// Mirror production: the reducer opens the turn, then side effects run.
+			stateManager.dispatchClientAction(defaultChatUri, action, { clientId: 'test', clientSeq: 1 });
+			bangSideEffects.handleAction(defaultChatUri, action);
+
+			// Wait until the command is running (its completion listener is
+			// registered), then signal that the command finished.
+			await terminalManager.commandFinishedListenerRegistered.p;
+			const terminalUri = terminalManager.created[0].channel;
+			terminalManager.fireCommandFinished({ commandId: '1', command: 'echo hi', exitCode: 0, output: 'hi\n' });
+
+			// Wait for the turn to be closed out.
+			await waitForState(stateManager, () => stateManager.getActiveTurnId(sessionUri.toString()) === undefined ? true : undefined);
+
+			assert.deepStrictEqual(agent.sendMessageCalls, []);
+			const state = stateManager.getSessionState(sessionUri.toString());
+			const part = state?.turns.at(-1)?.responseParts[0];
+			assert.strictEqual(part?.kind, ResponsePartKind.ToolCall);
+			const toolCall = part?.kind === ResponsePartKind.ToolCall ? part.toolCall : undefined;
+			assert.strictEqual(toolCall?.status, ToolCallStatus.Completed);
+			assert.strictEqual(toolCall?.status === ToolCallStatus.Completed ? toolCall.success : undefined, true);
+			assert.ok(toolCall?.status === ToolCallStatus.Completed
+				&& toolCall.content?.some(c => c.type === ToolResultContentType.Terminal && c.resource === terminalUri));
+			assert.strictEqual(terminalManager.created.length, 1);
+			assert.ok(terminalManager.sentTexts.some(s => s.data.includes('echo hi')));
+		});
+
+		test('a lone ! is forwarded to the agent instead of running a command', async () => {
+			setupSession();
+			const terminalManager = disposables.add(new TestAgentHostTerminalManager());
+			const bangSideEffects = createBangSideEffects(terminalManager);
+			const action: ChatAction = {
+				type: ActionType.ChatTurnStarted,
+				turnId: 'turn-1',
+				startedAt: '2025-01-01T00:00:00.000Z',
+				message: { text: '!', origin: { kind: MessageKind.User } },
+			};
+			stateManager.dispatchClientAction(defaultChatUri, action, { clientId: 'test', clientSeq: 1 });
+			bangSideEffects.handleAction(defaultChatUri, action);
+
+			await waitForSendMessageCalls(1);
+
+			assert.strictEqual(agent.sendMessageCalls[0].prompt, '!');
+			assert.strictEqual(terminalManager.created.length, 0);
+		});
+
+		test('records the completed bang turn as a local turn, stripped of the live terminal reference', async () => {
+			setupSession('file:///work');
+			const db = new TestSessionDatabase();
+			const localTurns = new AgentHostLocalTurns(createSessionDataService(db), new NullLogService());
+			const terminalManager = disposables.add(new TestAgentHostTerminalManager());
+			const bangSideEffects = createTestSideEffects(disposables, stateManager, {
+				getAgent: () => agent,
+				agents: agentList,
+				sessionDataService: createSessionDataService(db),
+				localTurns,
+				onTurnComplete: () => { },
+			}, undefined, undefined, undefined, terminalManager);
+
+			const action: ChatAction = {
+				type: ActionType.ChatTurnStarted,
+				turnId: 'turn-1',
+				startedAt: '2025-01-01T00:00:00.000Z',
+				message: { text: '!echo hi', origin: { kind: MessageKind.User } },
+			};
+			stateManager.dispatchClientAction(defaultChatUri, action, { clientId: 'test', clientSeq: 1 });
+			bangSideEffects.handleAction(defaultChatUri, action);
+
+			await terminalManager.commandFinishedListenerRegistered.p;
+			terminalManager.fireCommandFinished({ commandId: '1', command: 'echo hi', exitCode: 0, output: 'hi\n' });
+			await waitForState(stateManager, () => stateManager.getActiveTurnId(sessionUri.toString()) === undefined ? true : undefined);
+
+			// The turn with no preceding real turn has no anchor.
+			assert.strictEqual(localTurns.resolveConcreteTurnId(defaultChatUri, 'turn-1'), undefined);
+			const persisted = await db.getLocalTurns();
+			assert.strictEqual(persisted.length, 1);
+			const payload = JSON.parse(persisted[0].payload) as { responseParts: { kind: string; toolCall?: { content?: { type: string }[] } }[] };
+			const toolCallPart = payload.responseParts.find(p => p.kind === ResponsePartKind.ToolCall);
+			// Live terminal reference is stripped; text output is retained.
+			assert.ok(toolCallPart?.toolCall?.content?.every(c => c.type !== ToolResultContentType.Terminal));
+			assert.ok(toolCallPart?.toolCall?.content?.some(c => c.type === ToolResultContentType.Text));
+		});
+	});
+
+	// ---- local turn persistence: anchoring + truncate resolution ---------
+
+	suite('local turn persistence', () => {
+
+		let clientSeq: number;
+
+		setup(() => {
+			clientSeq = 0;
+		});
+
+		/** Drives a normal (SDK-backed) turn into `turns[]` via the reducer. */
+		function seedRealTurn(turnId: string, text: string): void {
+			stateManager.dispatchClientAction(defaultChatUri, {
+				type: ActionType.ChatTurnStarted, turnId, startedAt: '2025-01-01T00:00:00.000Z', message: { text, origin: { kind: MessageKind.User } },
+			}, { clientId: 'test', clientSeq: ++clientSeq });
+			stateManager.dispatchServerAction(defaultChatUri, { type: ActionType.ChatTurnComplete, turnId, duration: 1000 });
+		}
+
+		async function runBang(se: AgentSideEffects, terminalManager: TestAgentHostTerminalManager, turnId: string): Promise<void> {
+			const action: ChatAction = {
+				type: ActionType.ChatTurnStarted, turnId, startedAt: '2025-01-01T00:00:00.000Z', message: { text: '!echo hi', origin: { kind: MessageKind.User } },
+			};
+			stateManager.dispatchClientAction(defaultChatUri, action, { clientId: 'test', clientSeq: ++clientSeq });
+			se.handleAction(defaultChatUri, action);
+			await terminalManager.commandFinishedListenerRegistered.p;
+			terminalManager.fireCommandFinished({ commandId: turnId, command: 'echo hi', exitCode: 0, output: 'hi\n' });
+			await waitForState(stateManager, () => stateManager.getActiveTurnId(sessionUri.toString()) === undefined ? true : undefined);
+		}
+
+		let localTurns: AgentHostLocalTurns;
+
+		function createLocalTurnSideEffects(db: TestSessionDatabase, terminalManager: TestAgentHostTerminalManager): AgentSideEffects {
+			const sessionDataService = createSessionDataService(db);
+			localTurns = new AgentHostLocalTurns(sessionDataService, new NullLogService());
+			return createTestSideEffects(disposables, stateManager, {
+				getAgent: () => agent,
+				agents: agentList,
+				sessionDataService,
+				localTurns,
+				onTurnComplete: () => { },
+			}, undefined, undefined, undefined, terminalManager);
+		}
+
+		test('anchors a bang turn to the preceding concrete turn', async () => {
+			setupSession('file:///work');
+			const db = new TestSessionDatabase();
+			const terminalManager = disposables.add(new TestAgentHostTerminalManager());
+			const se = createLocalTurnSideEffects(db, terminalManager);
+
+			seedRealTurn('real-1', 'hello');
+			await runBang(se, terminalManager, 'local-1');
+
+			assert.strictEqual(localTurns.resolveConcreteTurnId(defaultChatUri, 'local-1'), 'real-1');
+			const persisted = await db.getLocalTurns();
+			assert.deepStrictEqual(persisted.map(r => ({ turnId: r.turnId, chatUri: r.chatUri, anchorTurnId: r.anchorTurnId })), [
+				{ turnId: 'local-1', chatUri: defaultChatUri, anchorTurnId: 'real-1' },
+			]);
+		});
+
+		test('truncating at a local turn redirects the SDK truncation to the concrete anchor', async () => {
+			setupSession('file:///work');
+			const db = new TestSessionDatabase();
+			const terminalManager = disposables.add(new TestAgentHostTerminalManager());
+			const se = createLocalTurnSideEffects(db, terminalManager);
+
+			seedRealTurn('real-1', 'hello');
+			await runBang(se, terminalManager, 'local-1');
+
+			// Truncate at the local turn (keep it). Reducer keeps [real-1, local-1].
+			stateManager.dispatchClientAction(defaultChatUri, { type: ActionType.ChatTruncated, turnId: 'local-1' }, { clientId: 'test', clientSeq: ++clientSeq });
+			se.handleAction(defaultChatUri, { type: ActionType.ChatTruncated, turnId: 'local-1' });
+
+			// The SDK is told to keep up to the concrete turn before the local one.
+			const truncateCall = agent.truncateSessionCalls.at(-1);
+			assert.strictEqual(truncateCall?.session.toString(), sessionUri.toString());
+			assert.strictEqual(truncateCall?.turnId, 'real-1');
+		});
+
+		test('truncating at a real turn drops the trailing local turn', async () => {
+			setupSession('file:///work');
+			const db = new TestSessionDatabase();
+			const terminalManager = disposables.add(new TestAgentHostTerminalManager());
+			const se = createLocalTurnSideEffects(db, terminalManager);
+
+			seedRealTurn('real-1', 'hello');
+			await runBang(se, terminalManager, 'local-1');
+
+			// Truncate at the real turn (drop the local turn after it).
+			stateManager.dispatchClientAction(defaultChatUri, { type: ActionType.ChatTruncated, turnId: 'real-1' }, { clientId: 'test', clientSeq: ++clientSeq });
+			se.handleAction(defaultChatUri, { type: ActionType.ChatTruncated, turnId: 'real-1' });
+
+			assert.strictEqual(agent.truncateSessionCalls.at(-1)?.turnId, 'real-1');
+			// The local turn is dropped from memory synchronously and from the DB async.
+			assert.strictEqual(localTurns.isLocal(defaultChatUri, 'local-1'), false);
+			await new Promise(r => setTimeout(r, 10));
+			assert.deepStrictEqual(await db.getLocalTurns(), []);
 		});
 	});
 
@@ -508,6 +898,7 @@ suite('AgentSideEffects', () => {
 			sideEffects.handleAction(defaultChatUri, {
 				type: ActionType.ChatTurnStarted,
 				turnId: 'turn-1',
+				startedAt: '2025-01-01T00:00:00.000Z',
 				message: { text: 'Fix the login bug', origin: { kind: MessageKind.User } },
 			});
 
@@ -527,6 +918,7 @@ suite('AgentSideEffects', () => {
 			sideEffects.handleAction(defaultChatUri, {
 				type: ActionType.ChatTurnStarted,
 				turnId: 'turn-1',
+				startedAt: '2025-01-01T00:00:00.000Z',
 				message: { text: '   ', origin: { kind: MessageKind.User } },
 			});
 
@@ -544,6 +936,7 @@ suite('AgentSideEffects', () => {
 			sideEffects.handleAction(defaultChatUri, {
 				type: ActionType.ChatTurnStarted,
 				turnId: 'turn-1',
+				startedAt: '2025-01-01T00:00:00.000Z',
 				message: { text: longMessage, origin: { kind: MessageKind.User } },
 			});
 
@@ -565,6 +958,7 @@ suite('AgentSideEffects', () => {
 			stateManager.dispatchServerAction(defaultChatUri, {
 				type: ActionType.ChatTurnComplete,
 				turnId: 'turn-1',
+				duration: 1000,
 			});
 
 			const envelopes: ActionEnvelope[] = [];
@@ -573,6 +967,7 @@ suite('AgentSideEffects', () => {
 			sideEffects.handleAction(defaultChatUri, {
 				type: ActionType.ChatTurnStarted,
 				turnId: 'turn-2',
+				startedAt: '2025-01-01T00:00:00.000Z',
 				message: { text: 'second message', origin: { kind: MessageKind.User } },
 			});
 
@@ -599,11 +994,184 @@ suite('AgentSideEffects', () => {
 			sideEffects.handleAction(defaultChatUri, {
 				type: ActionType.ChatTurnStarted,
 				turnId: 'turn-1',
+				startedAt: '2025-01-01T00:00:00.000Z',
 				message: { text: 'hello', origin: { kind: MessageKind.User } },
 			});
 
 			const titleAction = envelopes.find(e => e.action.type === ActionType.SessionTitleChanged);
 			assert.strictEqual(titleAction, undefined, 'should not clobber existing title');
+		});
+	});
+
+	suite('turn completion — read/unread', () => {
+
+		function readChangesFrom(envelopes: readonly ActionEnvelope[]): boolean[] {
+			return envelopes
+				.filter(e => e.action.type === ActionType.SessionIsReadChanged)
+				.map(e => (e.action as { isRead: boolean }).isRead);
+		}
+
+		/**
+		 * Turn completion persists the (un)read flag, so these tests need a real
+		 * session database rather than the suite's null data service.
+		 */
+		function setupPersisting(): { sideEffects: AgentSideEffects; db: TestSessionDatabase } {
+			const db = new TestSessionDatabase();
+			const persisting = createTestSideEffects(disposables, stateManager, {
+				getAgent: () => agent,
+				agents: agentList,
+				sessionDataService: createSessionDataService(db),
+				onTurnComplete: () => { },
+			}, undefined, disposables.add(new AgentHostTelemetryService(telemetryService)));
+			return { sideEffects: persisting, db };
+		}
+
+		test('marks a read session unread when a turn completes', () => {
+			const { sideEffects: persisting } = setupPersisting();
+			setupSession();
+			// The session has been read (e.g. a client viewed it).
+			stateManager.dispatchServerAction(sessionUri.toString(), { type: ActionType.SessionIsReadChanged, isRead: true });
+			disposables.add(persisting.registerProgressListener(agent));
+			startTurn('turn-1');
+
+			const envelopes: ActionEnvelope[] = [];
+			disposables.add(stateManager.onDidEmitEnvelope(e => envelopes.push(e)));
+
+			agent.fireProgress({
+				kind: 'action', resource: URI.parse(defaultChatUri),
+				action: { type: ActionType.ChatTurnComplete, turnId: 'turn-1', duration: 1000 },
+			});
+
+			assert.deepStrictEqual({
+				readChanges: readChangesFrom(envelopes),
+				isReadBitSet: (stateManager.getSessionSummary(sessionUri.toString())!.status & SessionStatus.IsRead) !== 0,
+			}, {
+				readChanges: [false],
+				isReadBitSet: false,
+			});
+		});
+
+		test('does not re-mark an already-unread session on turn completion', () => {
+			const { sideEffects: persisting } = setupPersisting();
+			setupSession();
+			// No SessionIsReadChanged dispatched: the session starts unread.
+			disposables.add(persisting.registerProgressListener(agent));
+			startTurn('turn-1');
+
+			const envelopes: ActionEnvelope[] = [];
+			disposables.add(stateManager.onDidEmitEnvelope(e => envelopes.push(e)));
+
+			agent.fireProgress({
+				kind: 'action', resource: URI.parse(defaultChatUri),
+				action: { type: ActionType.ChatTurnComplete, turnId: 'turn-1', duration: 1000 },
+			});
+
+			assert.deepStrictEqual(readChangesFrom(envelopes), []);
+		});
+
+		test('persists the unread flag so it survives a host restart', async () => {
+			const { sideEffects: persisting, db } = setupPersisting();
+			setupSession();
+			stateManager.dispatchServerAction(sessionUri.toString(), { type: ActionType.SessionIsReadChanged, isRead: true });
+			disposables.add(persisting.registerProgressListener(agent));
+			startTurn('turn-1');
+
+			agent.fireProgress({
+				kind: 'action', resource: URI.parse(defaultChatUri),
+				action: { type: ActionType.ChatTurnComplete, turnId: 'turn-1', duration: 1000 },
+			});
+
+			assert.strictEqual(await db.getMetadata('isRead'), '');
+		});
+
+		test('marks the parent session unread when a subagent turn completes', () => {
+			const { sideEffects: persisting } = setupPersisting();
+			setupSession();
+			// The session has been read (e.g. a client viewed it after the parent
+			// turn already produced output). A background subagent then completes.
+			stateManager.dispatchServerAction(sessionUri.toString(), { type: ActionType.SessionIsReadChanged, isRead: true });
+			disposables.add(persisting.registerProgressListener(agent));
+			startTurn('turn-1');
+
+			// Spawn a subagent chat off a parent tool call.
+			agent.fireProgress({
+				kind: 'action', resource: URI.parse(defaultChatUri),
+				action: {
+					type: ActionType.ChatToolCallStart, turnId: 'turn-1',
+					toolCallId: 'tc-1', toolName: 'runSubagent', displayName: 'Run Subagent', contributor: undefined,
+					_meta: { toolKind: undefined, language: undefined },
+				},
+			});
+			agent.fireProgress({
+				kind: 'subagent_started', chat: URI.parse(defaultChatUri),
+				toolCallId: 'tc-1', agentName: 'code-reviewer', agentDisplayName: 'Code Reviewer',
+			});
+
+			const subagentUri = buildSubagentChatUri(sessionUri.toString(), 'tc-1');
+			const subagentTurnId = stateManager.getSessionState(subagentUri)!.activeTurn!.id;
+
+			const envelopes: ActionEnvelope[] = [];
+			disposables.add(stateManager.onDidEmitEnvelope(e => envelopes.push(e)));
+
+			agent.fireProgress({
+				kind: 'action', resource: URI.parse(subagentUri),
+				action: { type: ActionType.ChatTurnComplete, turnId: subagentTurnId, duration: 1000 },
+			});
+
+			assert.deepStrictEqual({
+				readChanges: readChangesFrom(envelopes),
+				isReadBitSet: (stateManager.getSessionSummary(sessionUri.toString())!.status & SessionStatus.IsRead) !== 0,
+			}, {
+				readChanges: [false],
+				isReadBitSet: false,
+			});
+		});
+		test('marks a read session unread when a turn is cancelled', () => {
+			const { sideEffects: persisting } = setupPersisting();
+			setupSession();
+			stateManager.dispatchServerAction(sessionUri.toString(), { type: ActionType.SessionIsReadChanged, isRead: true });
+			disposables.add(persisting.registerProgressListener(agent));
+			startTurn('turn-1');
+
+			const envelopes: ActionEnvelope[] = [];
+			disposables.add(stateManager.onDidEmitEnvelope(e => envelopes.push(e)));
+
+			agent.fireProgress({
+				kind: 'action', resource: URI.parse(defaultChatUri),
+				action: { type: ActionType.ChatTurnCancelled, turnId: 'turn-1', duration: 1000 },
+			});
+
+			assert.deepStrictEqual({
+				readChanges: readChangesFrom(envelopes),
+				isReadBitSet: (stateManager.getSessionSummary(sessionUri.toString())!.status & SessionStatus.IsRead) !== 0,
+			}, {
+				readChanges: [false],
+				isReadBitSet: false,
+			});
+		});
+
+		test('marks a read session unread when a turn errors', () => {
+			const { sideEffects: persisting } = setupPersisting();
+			setupSession();
+			stateManager.dispatchServerAction(sessionUri.toString(), { type: ActionType.SessionIsReadChanged, isRead: true });
+			disposables.add(persisting.registerProgressListener(agent));
+			startTurn('turn-1');
+
+			const envelopes: ActionEnvelope[] = [];
+			disposables.add(stateManager.onDidEmitEnvelope(e => envelopes.push(e)));
+
+			agent.fireProgress({
+				kind: 'action', resource: URI.parse(defaultChatUri),
+				action: { type: ActionType.ChatError, turnId: 'turn-1', duration: 1000, error: { errorType: 'Error', message: 'boom' } },
+			});
+
+			assert.deepStrictEqual({
+				readChanges: readChangesFrom(envelopes),
+				isReadBitSet: (stateManager.getSessionSummary(sessionUri.toString())!.status & SessionStatus.IsRead) !== 0,
+			}, {
+				readChanges: [false],
+				isReadBitSet: false,
+			});
 		});
 	});
 
@@ -614,6 +1182,7 @@ suite('AgentSideEffects', () => {
 			sideEffects.handleAction(defaultChatUri, {
 				type: ActionType.ChatTurnCancelled,
 				turnId: 'turn-1',
+				duration: 1000,
 			});
 
 			await new Promise(r => setTimeout(r, 10));
@@ -631,6 +1200,7 @@ suite('AgentSideEffects', () => {
 			sideEffects.handleAction(defaultChatUri, {
 				type: ActionType.ChatTurnStarted,
 				turnId: 'turn-1',
+				startedAt: '2025-01-01T00:00:00.000Z',
 				message: { text: 'hello', origin: { kind: MessageKind.User }, model: { id: 'gpt-5' } },
 			});
 
@@ -657,6 +1227,7 @@ suite('AgentSideEffects', () => {
 			sideEffects.handleAction(defaultChatUri, {
 				type: ActionType.ChatTurnStarted,
 				turnId: 'turn-1',
+				startedAt: '2025-01-01T00:00:00.000Z',
 				message: { text: 'hello', origin: { kind: MessageKind.User }, model: { id: 'gpt-5' } },
 			});
 			await Promise.resolve();
@@ -681,6 +1252,7 @@ suite('AgentSideEffects', () => {
 			sideEffects.handleAction(chatChannel, {
 				type: ActionType.ChatTurnStarted,
 				turnId: 'turn-1',
+				startedAt: '2025-01-01T00:00:00.000Z',
 				message: { text: 'hello', origin: { kind: MessageKind.User }, model: { id: 'gpt-5' } },
 			});
 
@@ -699,6 +1271,7 @@ suite('AgentSideEffects', () => {
 			sideEffects.handleAction(defaultChatUri, {
 				type: ActionType.ChatTurnStarted,
 				turnId: 'turn-1',
+				startedAt: '2025-01-01T00:00:00.000Z',
 				message: { text: 'hello', origin: { kind: MessageKind.User }, agent: { uri: 'file:///agents/reviewer.md' } },
 			});
 
@@ -713,6 +1286,7 @@ suite('AgentSideEffects', () => {
 			sideEffects.handleAction(chatChannel, {
 				type: ActionType.ChatTurnStarted,
 				turnId: 'turn-1',
+				startedAt: '2025-01-01T00:00:00.000Z',
 				message: { text: 'hello', origin: { kind: MessageKind.User }, agent: { uri: 'file:///agents/reviewer.md' } },
 			});
 
@@ -763,6 +1337,79 @@ suite('AgentSideEffects', () => {
 				action: { type: ActionType.ChatResponsePart, turnId: 'turn-1', part: { kind: ResponsePartKind.Markdown, id: 'msg-2', content: 'after' } },
 			});
 			assert.strictEqual(envelopes.filter(e => e.action.type === ActionType.ChatResponsePart).length, 1);
+		});
+
+		test('customizations change publishes once, then dedupes identical re-fetches', async () => {
+			setupSession();
+
+			// Return a freshly-built array of freshly-built objects on every
+			// fetch (matching real providers, which re-scan disk each time) so
+			// the dedup is proven to rely on structural equality, not reference
+			// identity.
+			const makeCustomizations = (): Customization[] => [
+				{ type: CustomizationType.Plugin, id: customizationId('file:///plugin-a'), uri: 'file:///plugin-a', name: 'Plugin A', enabled: true, load: { kind: CustomizationLoadStatus.Loaded } },
+			];
+			let fetchCalls = 0;
+			agent.getSessionCustomizations = async () => { fetchCalls++; return makeCustomizations(); };
+
+			const changed: ActionEnvelope[] = [];
+			disposables.add(stateManager.onDidEmitEnvelope(e => {
+				if (e.action.type === ActionType.SessionCustomizationsChanged) {
+					changed.push(e);
+				}
+			}));
+			disposables.add(sideEffects.registerProgressListener(agent));
+
+			// First change: fetch + publish.
+			agent.fireCustomizationsChange();
+			await waitForState(stateManager, () => changed.length >= 1 || undefined);
+			assert.strictEqual(changed.length, 1);
+
+			// Subsequent changes that resolve to structurally-equal customizations
+			// (e.g. the O(N^2) fan-out from a shared `~/.claude` edit) must not
+			// re-publish, even though each fetch returns a brand-new array.
+			agent.fireCustomizationsChange();
+			agent.fireCustomizationsChange();
+			const deadline = Date.now() + 5000;
+			while (fetchCalls < 3 && Date.now() < deadline) {
+				await timeout(5);
+			}
+			assert.strictEqual(changed.length, 1, 'identical customizations must not re-publish');
+			assert.ok(fetchCalls >= 3, 'each change still re-fetches to compare');
+		});
+
+		test('re-publishes after session eviction + restore even when customizations are unchanged', async () => {
+			setupSession();
+
+			const makeCustomizations = (): Customization[] => [
+				{ type: CustomizationType.Plugin, id: customizationId('file:///plugin-a'), uri: 'file:///plugin-a', name: 'Plugin A', enabled: true, load: { kind: CustomizationLoadStatus.Loaded } },
+			];
+			agent.getSessionCustomizations = async () => makeCustomizations();
+
+			const changed: ActionEnvelope[] = [];
+			disposables.add(stateManager.onDidEmitEnvelope(e => {
+				if (e.action.type === ActionType.SessionCustomizationsChanged) {
+					changed.push(e);
+				}
+			}));
+			disposables.add(sideEffects.registerProgressListener(agent));
+
+			// Initial publish populates the session state's customizations.
+			agent.fireCustomizationsChange();
+			await waitForState(stateManager, () => changed.length >= 1 || undefined);
+			assert.strictEqual(changed.length, 1);
+
+			// Idle-evict then restore the same session URI: the restored state
+			// starts without customizations. Because dedup compares against the
+			// authoritative session state (not a stale side cache), the next
+			// refresh must publish again even though the resolved set is
+			// structurally identical to the prior incarnation's.
+			stateManager.removeSession(sessionUri.toString());
+			setupSession();
+
+			agent.fireCustomizationsChange();
+			await waitForState(stateManager, () => changed.length >= 2 || undefined);
+			assert.strictEqual(changed.length, 2, 'restored session must receive its customizations');
 		});
 	});
 
@@ -1051,7 +1698,7 @@ suite('AgentSideEffects', () => {
 			// Fire idle → turn completes → queued message should be consumed
 			agent.fireProgress({
 				kind: 'action', resource: URI.parse(defaultChatUri),
-				action: { type: ActionType.ChatTurnComplete, turnId: 'turn-1' },
+				action: { type: ActionType.ChatTurnComplete, turnId: 'turn-1', duration: 1000 },
 			});
 
 			const turnComplete = envelopes.find(e => e.action.type === ActionType.ChatTurnComplete);
@@ -1093,7 +1740,7 @@ suite('AgentSideEffects', () => {
 			assert.strictEqual(agent.sendMessageCalls.length, 0);
 
 			// Cancel the active turn (client abort).
-			const cancelAction = { type: ActionType.ChatTurnCancelled as const, turnId: 'turn-1' };
+			const cancelAction = { type: ActionType.ChatTurnCancelled as const, turnId: 'turn-1', duration: 1000 };
 			stateManager.dispatchClientAction(defaultChatUri, cancelAction, { clientId: 'test', clientSeq: 2 });
 			sideEffects.handleAction(defaultChatUri, cancelAction);
 
@@ -1137,7 +1784,7 @@ suite('AgentSideEffects', () => {
 			// then the message queued behind it must be drained to the agent.
 			agent.fireProgress({
 				kind: 'action', resource: URI.parse(defaultChatUri),
-				action: { type: ActionType.ChatTurnComplete, turnId: 'turn-1' },
+				action: { type: ActionType.ChatTurnComplete, turnId: 'turn-1', duration: 1000 },
 			});
 
 			// The `/rename` must not reach the agent; only the message behind it does
@@ -1159,7 +1806,7 @@ suite('AgentSideEffects', () => {
 
 			// Start a turn on the peer chat, then queue a message behind it.
 			stateManager.dispatchClientAction(chatUri.toString(),
-				{ type: ActionType.ChatTurnStarted, turnId: 'pturn-1', message: { text: 'hi', origin: { kind: MessageKind.User } } },
+				{ type: ActionType.ChatTurnStarted, turnId: 'pturn-1', startedAt: '2025-01-01T00:00:00.000Z', message: { text: 'hi', origin: { kind: MessageKind.User } } },
 				{ clientId: 'test', clientSeq: 1 });
 			const setAction = {
 				type: ActionType.ChatPendingMessageSet as const,
@@ -1177,7 +1824,7 @@ suite('AgentSideEffects', () => {
 			// so the harness routes it to the right peer SDK chat.
 			agent.fireProgress({
 				kind: 'action', resource: chatUri,
-				action: { type: ActionType.ChatTurnComplete, turnId: 'pturn-1' },
+				action: { type: ActionType.ChatTurnComplete, turnId: 'pturn-1', duration: 1000 },
 			});
 
 			await waitForSendMessageCalls(1);
@@ -1453,6 +2100,7 @@ suite('AgentSideEffects', () => {
 			sideEffects.handleAction(defaultChatUri, {
 				type: ActionType.ChatTurnStarted,
 				turnId: 'turn-1',
+				startedAt: '2025-01-01T00:00:00.000Z',
 				message: { text: 'hello world', origin: { kind: MessageKind.User } },
 			});
 
@@ -1703,6 +2351,65 @@ suite('AgentSideEffects', () => {
 				'tool call should advance to PendingConfirmation for permission-gated tool_ready');
 		});
 
+		test('tool_ready is dropped when the tool completes while permission lookup is pending', async () => {
+			setupSession();
+			startTurn('turn-1');
+			disposables.add(sideEffects.registerProgressListener(agent));
+
+			const envelopes: ActionEnvelope[] = [];
+			disposables.add(stateManager.onDidEmitEnvelope(e => envelopes.push(e)));
+
+			agent.fireProgress({
+				kind: 'action', resource: URI.parse(defaultChatUri),
+				action: {
+					type: ActionType.ChatToolCallStart, turnId: 'turn-1',
+					toolCallId: 'tc-stale-ready', toolName: 'vscodeAPI', displayName: 'Get VS Code API References',
+					contributor: { kind: ToolCallContributorKind.Client, clientId: 'disconnected-client' },
+					_meta: { toolKind: undefined, language: undefined },
+				},
+			});
+			agent.fireProgress({
+				kind: 'pending_confirmation', chat: URI.parse(defaultChatUri),
+				state: {
+					status: ToolCallStatus.PendingConfirmation,
+					toolCallId: 'tc-stale-ready', toolName: 'vscodeAPI', displayName: 'Get VS Code API References',
+					invocationMessage: 'Get VS Code API References', toolInput: '{"query":"test"}',
+					confirmationTitle: 'Allow tool call?', edits: undefined,
+				},
+				permissionKind: 'custom-tool', permissionPath: undefined,
+			});
+
+			stateManager.dispatchServerAction(defaultChatUri, {
+				type: ActionType.ChatToolCallReady,
+				turnId: 'turn-1',
+				toolCallId: 'tc-stale-ready',
+				invocationMessage: 'Get VS Code API References',
+				confirmed: ToolCallConfirmationReason.NotNeeded,
+			});
+			stateManager.dispatchServerAction(defaultChatUri, {
+				type: ActionType.ChatToolCallComplete,
+				turnId: 'turn-1',
+				toolCallId: 'tc-stale-ready',
+				result: {
+					success: false,
+					pastTenseMessage: 'Get VS Code API References failed',
+					error: { message: 'Client disconnected' },
+				},
+			});
+
+			await Promise.resolve();
+
+			const toolCall = stateManager.getSessionState(sessionUri.toString())?.activeTurn?.responseParts
+				.find(part => part.kind === ResponsePartKind.ToolCall && part.toolCall.toolCallId === 'tc-stale-ready');
+			assert.deepStrictEqual({
+				status: toolCall?.kind === ResponsePartKind.ToolCall ? toolCall.toolCall.status : undefined,
+				readyActions: envelopes.filter(e => e.action.type === ActionType.ChatToolCallReady).length,
+			}, {
+				status: ToolCallStatus.Completed,
+				readyActions: 1,
+			});
+		});
+
 		test('tool_ready for an additional chat is emitted on that chat channel', async () => {
 			setupSession();
 			const chatUri = buildChatUri(sessionUri.toString(), 'peer');
@@ -1885,7 +2592,7 @@ suite('AgentSideEffects', () => {
 			});
 			agent.fireProgress({
 				kind: 'action', resource: URI.parse(defaultChatUri),
-				action: { type: ActionType.ChatTurnComplete, turnId: 'turn-1' },
+				action: { type: ActionType.ChatTurnComplete, turnId: 'turn-1', duration: 1000 },
 			});
 
 			// Verify no active turn
@@ -2271,6 +2978,7 @@ suite('AgentSideEffects', () => {
 				{ requestId: 'tc-mid-1', approved: true },
 			]);
 		});
+
 	});
 
 	// ---- Edit auto-approve ----------------------------------------------
@@ -2651,6 +3359,40 @@ suite('AgentSideEffects', () => {
 			assert.strictEqual(state!.title, 'Restored Title');
 		});
 
+		test('restore interleaves a persisted local turn after its anchor', async () => {
+			const sessionDataService = createSessionDataService(sessionDb);
+			const localAgent = new MockAgent();
+			disposables.add(toDisposable(() => localAgent.dispose()));
+			const localService = disposables.add(new AgentService(new NullLogService(), fileService, sessionDataService, { _serviceBrand: undefined } as IProductService, createNoopGitService()));
+			localService.registerProvider(localAgent);
+
+			const { session } = await localAgent.createSession();
+			const sessions = await localAgent.listSessions();
+			const sessionResource = sessions[0].session;
+
+			// The SDK transcript yields a single real turn keyed by the first
+			// user message id (`buildTurnsFromHistory`).
+			localAgent.sessionMessages = [
+				{ type: 'message', session, role: 'user', messageId: 'real-1', content: 'Hello', toolRequests: [] },
+				{ type: 'message', session, role: 'assistant', messageId: 'a-1', content: 'Hi', toolRequests: [] },
+			];
+
+			// A host-injected local turn recorded against that real turn.
+			const localTurn = {
+				id: 'local-1',
+				message: { text: '!echo hi', origin: { kind: MessageKind.User } },
+				responseParts: [{ kind: ResponsePartKind.Markdown, id: 'p1', content: 'ran' }],
+				usage: undefined,
+				state: 2, // TurnState.Complete
+			};
+			await sessionDb.insertLocalTurn({ turnId: 'local-1', chatUri: buildDefaultChatUri(sessionResource.toString()), anchorTurnId: 'real-1', seq: 1, payload: JSON.stringify(localTurn) });
+
+			await localService.restoreSession(sessionResource);
+
+			const state = localService.stateManager.getSessionState(sessionResource.toString());
+			assert.deepStrictEqual(state?.turns.map(t => t.id), ['real-1', 'local-1']);
+		});
+
 		test('SessionConfigChanged persists merged config values to the database', async () => {
 			const sessionDataService = createSessionDataService(sessionDb);
 			const localStateManager = disposables.add(new AgentHostStateManager(new NullLogService()));
@@ -2689,6 +3431,50 @@ suite('AgentSideEffects', () => {
 			const persisted = await sessionDb.getMetadata('configValues');
 			assert.ok(persisted);
 			assert.deepStrictEqual(JSON.parse(persisted!), { autoApprove: 'autoApprove' });
+		});
+
+		test('SessionConfigChanged notifies the agent with the post-reducer merged values', async () => {
+			// The client-action side-effects path is where a picker edit lands
+			// (internal server writes use `dispatchServerAction` and never reach
+			// `handleAction`), so forwarding a live config change to the provider
+			// from here is inherently client-only. Pins that `onSessionConfigChanged`
+			// receives the full merged config, not just the patch.
+			const localStateManager = disposables.add(new AgentHostStateManager(new NullLogService()));
+			const localAgent = new MockAgent();
+			disposables.add(toDisposable(() => localAgent.dispose()));
+			const localSideEffects = createTestSideEffects(disposables, localStateManager, {
+				getAgent: () => localAgent,
+				agents: observableValue<readonly IAgent[]>('agents', [localAgent]),
+				sessionDataService: createSessionDataService(sessionDb),
+				onTurnComplete: () => { },
+			});
+
+			const session = localStateManager.createSession({
+				resource: sessionUri.toString(),
+				provider: 'mock',
+				title: 'Initial',
+				status: SessionStatus.Idle,
+				createdAt: new Date().toISOString(),
+				modifiedAt: new Date().toISOString(),
+			});
+			// Seed a second key the patch does NOT touch: if the hook received the
+			// raw patch instead of the merged values, `autoApprove` would be
+			// missing — so asserting it survives pins the "merged values" contract.
+			session.config = { schema: { type: 'object', properties: {} }, values: { permissionMode: 'default', autoApprove: 'default' } };
+
+			localStateManager.dispatchClientAction(sessionUri.toString(), {
+				type: ActionType.SessionConfigChanged,
+				config: { permissionMode: 'bypassPermissions' },
+			}, { clientId: 'test-client', clientSeq: 1 });
+			localSideEffects.handleAction(sessionUri.toString(), {
+				type: ActionType.SessionConfigChanged,
+				config: { permissionMode: 'bypassPermissions' },
+			});
+
+			assert.deepStrictEqual(localAgent.onSessionConfigChangedCalls.map(c => ({ session: c.session.toString(), values: c.values })), [{
+				session: sessionUri.toString(),
+				values: { permissionMode: 'bypassPermissions', autoApprove: 'default' },
+			}]);
 		});
 	});
 
@@ -2978,6 +3764,7 @@ suite('AgentSideEffects', () => {
 			sideEffects.handleAction(defaultChatUri, {
 				type: ActionType.ChatTurnCancelled,
 				turnId: 'turn-1',
+				duration: 1000,
 			});
 
 			// Both subagent chats should have their turns completed (cancelled)
@@ -3317,6 +4104,68 @@ suite('AgentSideEffects', () => {
 			assert.deepStrictEqual(sessionInputNeeded(), []);
 		});
 
+		test('MCP tool authentication is produced while auth is required and removed once resolved', () => {
+			setupSession();
+			startTurn('turn-1');
+
+			stateManager.dispatchServerAction(defaultChatUri, {
+				type: ActionType.ChatToolCallStart,
+				turnId: 'turn-1',
+				toolCallId: 'tc-mcp',
+				toolName: 'get_file',
+				displayName: 'Get File',
+				contributor: { kind: ToolCallContributorKind.MCP, customizationId: 'mcp-1' },
+			});
+			stateManager.dispatchServerAction(defaultChatUri, {
+				type: ActionType.ChatToolCallReady,
+				turnId: 'turn-1',
+				toolCallId: 'tc-mcp',
+				invocationMessage: 'Getting file',
+				confirmed: ToolCallConfirmationReason.NotNeeded,
+			});
+			stateManager.dispatchServerAction(defaultChatUri, {
+				type: ActionType.ChatToolCallAuthRequired,
+				turnId: 'turn-1',
+				toolCallId: 'tc-mcp',
+				auth: {
+					reason: McpAuthRequiredReason.InsufficientScope,
+					resource: {
+						resource: 'https://mcp.example.com',
+						authorization_servers: ['https://auth.example.com'],
+					},
+					requiredScopes: ['repo'],
+				},
+			});
+
+			const pending = sessionInputNeeded();
+			stateManager.dispatchServerAction(defaultChatUri, {
+				type: ActionType.ChatToolCallComplete,
+				turnId: 'turn-1',
+				toolCallId: 'tc-mcp',
+				result: {
+					success: false,
+					pastTenseMessage: 'Cancelled tool call',
+					error: { message: 'MCP authentication was cancelled', code: 'cancelled' },
+				},
+			});
+
+			assert.deepStrictEqual({
+				pending: pending.map(request => ({
+					kind: request.kind,
+					chat: request.chat,
+					toolCallId: request.kind === SessionInputRequestKind.ToolAuthentication ? request.toolCall.toolCallId : undefined,
+				})),
+				resolved: sessionInputNeeded(),
+			}, {
+				pending: [{
+					kind: SessionInputRequestKind.ToolAuthentication,
+					chat: defaultChatUri,
+					toolCallId: 'tc-mcp',
+				}],
+				resolved: [],
+			});
+		});
+
 		test('ending the turn clears the chat\'s outstanding requests', () => {
 			setupSession();
 			startTurn('turn-1');
@@ -3327,7 +4176,7 @@ suite('AgentSideEffects', () => {
 			});
 			assert.strictEqual(sessionInputNeeded().length, 1);
 
-			stateManager.dispatchServerAction(defaultChatUri, { type: ActionType.ChatTurnCancelled, turnId: 'turn-1' });
+			stateManager.dispatchServerAction(defaultChatUri, { type: ActionType.ChatTurnCancelled, turnId: 'turn-1', duration: 1000 });
 
 			assert.deepStrictEqual(sessionInputNeeded(), []);
 		});
@@ -3648,7 +4497,7 @@ suite('AgentSideEffects', () => {
 
 			agent.fireProgress({
 				kind: 'action', resource: URI.parse(defaultChatUri),
-				action: { type: ActionType.ChatTurnComplete, turnId: 'turn-1' },
+				action: { type: ActionType.ChatTurnComplete, turnId: 'turn-1', duration: 1000 },
 			});
 
 			// `_runTurnCompleteSideEffects` now defers the
@@ -3678,6 +4527,34 @@ suite('AgentSideEffects', () => {
 			});
 
 			assert.deepStrictEqual(changesets.truncates, [sessionUri.toString()]);
+		});
+
+		test('truncating a chat forwards that chat to the agent (default and peer)', () => {
+			setupSession();
+			const peerChatUri = buildChatUri(sessionUri.toString(), 'peer-1');
+
+			// Peer chat: the chat URI is forwarded so the agent targets that
+			// chat's own backing rather than the session's default chat.
+			sideEffects.handleAction(peerChatUri, { type: ActionType.ChatTruncated, turnId: 'turn-peer' });
+			const peerCall = agent.truncateSessionCalls.at(-1);
+
+			// Default chat: forwarded as the session's default chat URI.
+			sideEffects.handleAction(defaultChatUri, { type: ActionType.ChatTruncated, turnId: 'turn-default' });
+			const defaultCall = agent.truncateSessionCalls.at(-1);
+
+			assert.deepStrictEqual({
+				peerSession: peerCall?.session.toString(),
+				peerTurnId: peerCall?.turnId,
+				peerChat: peerCall?.chat?.toString(),
+				defaultTurnId: defaultCall?.turnId,
+				defaultChat: defaultCall?.chat?.toString(),
+			}, {
+				peerSession: sessionUri.toString(),
+				peerTurnId: 'turn-peer',
+				peerChat: peerChatUri,
+				defaultTurnId: 'turn-default',
+				defaultChat: defaultChatUri,
+			});
 		});
 	});
 
