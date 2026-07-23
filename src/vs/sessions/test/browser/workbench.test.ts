@@ -13,6 +13,7 @@ import { Workbench } from '../../browser/workbench.js';
 import { DockedEditorSizeMemento, SinglePaneWorkbench } from '../../browser/singlePaneWorkbench.js';
 import { SinglePaneMainEditorPart } from '../../browser/parts/singlePaneEditorPart.js';
 import { DockedEditorInput } from '../../common/dockedEditorInput.js';
+import { EditorInputCapabilities } from '../../../workbench/common/editor.js';
 import { SESSIONS_LIST_MINIMUM_WIDTH } from '../../browser/parts/sidebarPart.js';
 
 interface IViewSize { width: number; height: number }
@@ -49,6 +50,7 @@ suite('Sessions - Workbench', () => {
 	const savePartSizes = Reflect.get(Workbench.prototype, '_savePartSizes') as (this: ISavePartSizesTestHarness) => void;
 	const isEditorPaneVisible = Workbench.prototype.isEditorPaneVisible as (this: ITestWorkbench) => boolean;
 	const isSinglePaneEditorPaneVisible = SinglePaneWorkbench.prototype.isEditorPaneVisible as (this: ITestWorkbench) => boolean;
+	const toggleEditorPane = SinglePaneWorkbench.prototype.toggleEditorPane as (this: ITestWorkbench) => void;
 
 	// --- Harness ------------------------------------------------------------
 
@@ -238,6 +240,20 @@ suite('Sessions - Workbench', () => {
 		host.workbenchGrid.isViewVisible = () => false;
 
 		assert.strictEqual(isSinglePaneEditorPaneVisible.call(host), false);
+	});
+
+	test('single-pane editor pane toggle controls the editor pane', () => {
+		const host = createHost({ single: true, partVisibility: { editor: true, auxiliaryBar: true } });
+
+		toggleEditorPane.call(host);
+
+		assert.deepStrictEqual({
+			editorVisible: host.partVisibility.editor,
+			auxiliaryBarVisible: host.partVisibility.auxiliaryBar,
+		}, {
+			editorVisible: false,
+			auxiliaryBarVisible: true,
+		});
 	});
 
 	test('updates the single-pane editor pane class after the grid node visibility changes', () => {
@@ -764,6 +780,20 @@ suite('Sessions - Workbench', () => {
 		revealEditorOnOpen.call(harness, { groupId: 1, editor: { typeId: 'workbench.editors.files.fileEditorInput' } });
 
 		assert.deepStrictEqual(setEditorHiddenCalls, []);
+	});
+
+	test('docked editors are excluded from the editor limit (prevents managed-tab open/close loop)', () => {
+		// The managed Changes/Files tabs are pinned but not sticky, so a per-group
+		// editor limit of 1 would otherwise evict them and the managed-tab
+		// reconciliation would reopen them, hanging the renderer. Docked inputs opt
+		// out of the limit so they are never auto-closed.
+		const dockedEditor = new TestDockedEditorInput();
+
+		try {
+			assert.strictEqual(dockedEditor.hasCapability(EditorInputCapabilities.ExcludeFromEditorLimit), true);
+		} finally {
+			dockedEditor.dispose();
+		}
 	});
 
 	test('[Scenario 5] single-pane does not reveal a docked editor while the detail panel is open and the editor is closed', () => {
