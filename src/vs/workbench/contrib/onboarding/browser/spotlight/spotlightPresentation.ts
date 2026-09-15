@@ -12,6 +12,7 @@ import { IWorkbenchLayoutService } from '../../../../services/layout/browser/lay
 import { IHostService } from '../../../../services/host/browser/host.js';
 import { IOnboardingPresentation, IOnboardingRunContext } from '../../common/onboardingPresentation.js';
 import { IOnboardingRunResult, IOnboardingScenario, OnboardingDismissReason, OnboardingOutcome } from '../../common/onboardingScenario.js';
+import { IOnboardingSequenceStep, IOnboardingSequenceStepContext, IOnboardingSequenceStepPresentation, IOnboardingSequenceStepResult } from '../../common/onboardingSequence.js';
 import { findOnboardingTarget, openOnboardingTarget } from './onboardingTarget.js';
 import { ISpotlightContent, SpotlightOverlay } from './spotlightOverlay.js';
 import { ISpotlightPayload, ISpotlightStep, SpotlightMissingTargetBehavior, SPOTLIGHT_PRESENTATION_KIND } from './spotlightTypes.js';
@@ -34,9 +35,10 @@ type StepEnd =
  * each. Implements the engine's {@link IOnboardingPresentation} contract so the
  * scenario engine can drive it without knowing anything about spotlights.
  */
-export class SpotlightPresentation extends Disposable implements IOnboardingPresentation {
+export class SpotlightPresentation extends Disposable implements IOnboardingPresentation, IOnboardingSequenceStepPresentation {
 
 	readonly kind = SPOTLIGHT_PRESENTATION_KIND;
+	readonly countsAsVisualStep = true;
 
 	constructor(
 		@IWorkbenchLayoutService private readonly layoutService: IWorkbenchLayoutService,
@@ -48,6 +50,73 @@ export class SpotlightPresentation extends Disposable implements IOnboardingPres
 
 	async run(scenario: IOnboardingScenario, context: IOnboardingRunContext): Promise<IOnboardingRunResult> {
 		const payload = scenario.presentation.payload as ISpotlightPayload;
+		return this._runPayload(payload, context);
+	}
+
+	async runStep(sequenceStep: IOnboardingSequenceStep, context: IOnboardingSequenceStepContext): Promise<IOnboardingSequenceStepResult> {
+		const step = sequenceStep.payload as ISpotlightStep;
+		if (step.when && !this.contextKeyService.contextMatchesRules(step.when)) {
+			return { action: 'skipStep', shown: false };
+		}
+
+		try {
+			await step.onBeforeShow?.();
+		} catch (error) {
+			onUnexpectedError(error);
+		}
+		if (context.cancellationToken.isCancellationRequested) {
+			return { action: 'abort', shown: false };
+		}
+
+		const target = await this._resolveTarget(context.targetWindow, step.targetId, context.cancellationToken, step.missingTarget);
+		if (!target) {
+			return context.cancellationToken.isCancellationRequested || step.missingTarget?.kind === 'abort'
+				? { action: 'abort', shown: false }
+				: { action: 'skipStep', shown: false };
+		}
+		await this._waitForTargetReady(context.targetWindow, target);
+		if (context.cancellationToken.isCancellationRequested) {
+			return { action: 'abort', shown: false };
+		}
+
+		const store = new DisposableStore();
+		try {
+			const container = this.layoutService.getContainer(context.targetWindow);
+			const overlay = store.add(new SpotlightOverlay(container));
+			this.hostService.setWindowDimmed(context.targetWindow, true);
+			store.add(toDisposable(() => this.hostService.setWindowDimmed(context.targetWindow, false)));
+			store.add(this.layoutService.onDidLayoutContainer(() => overlay.scheduleLayout()));
+			const end = await this._runStep(
+				overlay,
+				context,
+				step,
+				target,
+				context.visualStepIndex,
+				context.visualStepCount,
+				context.canGoBack,
+				context.isLastVisualStep,
+			);
+			overlay.hide();
+			switch (end.action) {
+				case 'next':
+					return {
+						action: 'next',
+						shown: true,
+						dismissReason: end.via === 'target' ? OnboardingDismissReason.TargetClick : OnboardingDismissReason.Completed,
+					};
+				case 'back':
+					return { action: 'back', shown: true };
+				case 'skip':
+					return { action: 'skipSequence', shown: true, dismissReason: end.reason };
+				case 'abort':
+					return { action: 'abort', shown: true };
+			}
+		} finally {
+			store.dispose();
+		}
+	}
+
+	private async _runPayload(payload: ISpotlightPayload, context: IOnboardingRunContext): Promise<IOnboardingRunResult> {
 		const steps = payload?.steps ?? [];
 		const stepCount = steps.length;
 		if (stepCount === 0) {
@@ -109,6 +178,10 @@ export class SpotlightPresentation extends Disposable implements IOnboardingPres
 					break;
 				}
 				if (!target) {
+					if (step.missingTarget?.kind === 'abort') {
+						aborted = true;
+						break;
+					}
 					skippedStepIndexes.add(index);
 					index += direction;
 					continue;
@@ -149,9 +222,10 @@ export class SpotlightPresentation extends Disposable implements IOnboardingPres
 				}
 			}
 
-			return aborted
-				? { outcome: OnboardingOutcome.Aborted, shown, dismissReason: OnboardingDismissReason.Aborted, lastStepIndex, stepCount }
-				: { outcome: OnboardingOutcome.Completed, shown, dismissReason: OnboardingDismissReason.Completed, lastStepIndex, stepCount };
+			if (aborted) {
+				return { outcome: OnboardingOutcome.Aborted, shown, dismissReason: OnboardingDismissReason.Aborted, lastStepIndex, stepCount };
+			}
+			return { outcome: OnboardingOutcome.Completed, shown, dismissReason: OnboardingDismissReason.Completed, lastStepIndex, stepCount };
 		} finally {
 			store.dispose();
 		}
@@ -162,7 +236,7 @@ export class SpotlightPresentation extends Disposable implements IOnboardingPres
 			return undefined;
 		}
 		let element = findOnboardingTarget(targetWindow, targetId);
-		if (element || behavior?.kind === 'skip') {
+		if (element || behavior?.kind === 'skip' || behavior?.kind === 'abort') {
 			return element;
 		}
 		const timeoutMs = behavior?.kind === 'wait' ? Math.max(0, behavior.timeoutMs) : TARGET_RESOLVE_TIMEOUT;
@@ -204,7 +278,7 @@ export class SpotlightPresentation extends Disposable implements IOnboardingPres
 		return animations;
 	}
 
-	private async _runStep(overlay: SpotlightOverlay, context: IOnboardingRunContext, step: ISpotlightStep, target: HTMLElement, index: number, stepCount: number): Promise<StepEnd> {
+	private async _runStep(overlay: SpotlightOverlay, context: IOnboardingRunContext, step: ISpotlightStep, target: HTMLElement, index: number, stepCount: number, canGoBack: boolean = index > 0, isLastStep: boolean = index === stepCount - 1): Promise<StepEnd> {
 		const stepStore = new DisposableStore();
 		let ended = false;
 		let resolveStep: (end: StepEnd) => void;
@@ -226,20 +300,22 @@ export class SpotlightPresentation extends Disposable implements IOnboardingPres
 		const content: ISpotlightContent = {
 			title: step.title,
 			description: step.description,
+			nextButtonLabel: step.nextButtonLabel,
 			stepIndex: index,
 			stepCount,
-			canGoBack: index > 0,
-			isLastStep: index === stepCount - 1,
+			canGoBack,
+			isLastStep,
 		};
 
 		overlay.show(target, content, {
 			placement: step.placement,
 			allowTargetInteraction: step.allowTargetInteraction,
 			advanceOnTargetClick: step.advanceOnTargetClick,
-			hideNext: !!step.advanceWhen,
+			hideNext: step.advanceWhen ? true : step.hideNext,
 			targetOverlayVisible: step.openTarget,
 			padding: step.padding,
 		});
+		context.onDidShow?.();
 
 		if (step.advanceWhen) {
 			const keys = new Set(step.advanceWhen.keys());

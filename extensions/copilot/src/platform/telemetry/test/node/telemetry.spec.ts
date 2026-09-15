@@ -379,20 +379,47 @@ suite('multiplexProperties compression', function () {
 		expect(result).toEqual({ someField: 'small', other: 'x' });
 	});
 
+	test.each([0, 100, 8192, 8193, 20000])('always compresses a prompt of length %i while preserving its raw prefix', async length => {
+		const prompt = 'x'.repeat(length);
+		const result = await multiplexProperties({ prompt }, gzipBase64);
+
+		expect(result).toEqual({
+			prompt: prompt.slice(0, 8192),
+			promptChunk: await gzipBase64(prompt),
+		});
+	});
+
 	test('always emits a compressed chunk family for known-large fields even when they fit', async () => {
 		const result = await multiplexProperties({ diffsJSON: 'small', messagesJson: 'tiny', other: 'x' }, gzipBase64) as { [key: string]: string };
 
 		// Known-large fields are always chunked in compressed form for backend uniformity.
 		expect(result.diffsJSONChunk).toBeDefined();
-		expect(result.messagesJsonChunk).toBeDefined();
+		// messagesJson uses the uppercase-JSON chunk family name expected by the backend.
+		expect(result.messagesJSONChunk).toBeDefined();
+		expect(result.messagesJsonChunk).toBeUndefined();
 		expect(gunzipFromBase64(joinCompressedChunks(result, 'diffsJSONChunk'))).toBe('small');
-		expect(gunzipFromBase64(joinCompressedChunks(result, 'messagesJsonChunk'))).toBe('tiny');
+		expect(gunzipFromBase64(joinCompressedChunks(result, 'messagesJSONChunk'))).toBe('tiny');
 		// The original columns still carry the (short) uncompressed value.
 		expect(result.diffsJSON).toBe('small');
 		expect(result.messagesJson).toBe('tiny');
 		// Other short fields are left untouched.
 		expect(result.other).toBe('x');
 		expect(result.otherChunk).toBeUndefined();
+	});
+
+	test('emits the messagesJSONChunk family (with numbered suffixes) for large messagesJson', async () => {
+		const original = pseudoRandomString(60000); // Poorly compressible -> compressed base64 > 8192.
+		const result = await multiplexProperties({ messagesJson: original }, gzipBase64) as { [key: string]: string };
+
+		// The original column carries just the first uncompressed chunk; no plain continuation family.
+		expect(result.messagesJson).toBe(original.slice(0, 8192));
+		expect(result.messagesJson_02).toBeUndefined();
+		// Compressed family uses the uppercase-JSON name, including numbered suffixes.
+		expect(result.messagesJSONChunk).toBeDefined();
+		expect(result.messagesJSONChunk_2).toBeDefined();
+		expect(result.messagesJsonChunk).toBeUndefined();
+		expect(result.messagesJsonChunk_2).toBeUndefined();
+		expect(gunzipFromBase64(joinCompressedChunks(result, 'messagesJSONChunk'))).toBe(original);
 	});
 
 	test('falls back to the plain continuation family when no compressor is provided', async () => {
