@@ -19,13 +19,15 @@ import { IAgentHostTerminalCreateOptions, IAgentHostTerminalService } from '../.
 import { ITerminalGroupService, ITerminalInstance, ITerminalService } from '../../../../../workbench/contrib/terminal/browser/terminal.js';
 import { ISessionsProvider } from '../../../../services/sessions/common/sessionsProvider.js';
 import { IAgentHostSessionsProvider, LOCAL_AGENT_HOST_PROVIDER_ID, REMOTE_AGENT_HOST_PROVIDER_PREFIX } from '../../../../common/agentHostSessionsProvider.js';
-import { IChat, ISession, ISessionFolder, ISessionWorkspace, SessionStatus } from '../../../../services/sessions/common/session.js';
+import { IChat, ISession, ISessionFolder, ISessionWorkspace, SessionRemoteConnectionFailureReason, SessionRemoteConnectionStatus, SessionStatus } from '../../../../services/sessions/common/session.js';
 import { ISessionsProvidersService } from '../../../../services/sessions/browser/sessionsProvidersService.js';
+import { IConfigurationResolverService } from '../../../../../workbench/services/configurationResolver/common/configurationResolver.js';
+import { IWorkspaceFolderData } from '../../../../../platform/workspace/common/workspace.js';
 import { ITaskEntry, ISessionsTasksService, ISessionTaskWithTarget } from '../../../chat/browser/sessionsTasksService.js';
 import { osToTaskTargetOS } from '../../../chat/browser/taskCommand.js';
 import { AgentHostSessionTaskRunner } from '../../browser/agentHostSessionTaskRunner.js';
 
-function makeSession(opts: { providerId: string; cwd?: URI }): ISession {
+function makeSession(opts: { providerId: string; cwd?: URI; remoteConnectionStatus?: SessionRemoteConnectionStatus }): ISession {
 	const folder: ISessionFolder | undefined = opts.cwd ? {
 		root: opts.cwd,
 		workingDirectory: opts.cwd,
@@ -58,13 +60,14 @@ function makeSession(opts: { providerId: string; cwd?: URI }): ISession {
 		modelId: observableValue('modelId', undefined),
 		mode: observableValue('mode', undefined),
 		loading: observableValue('loading', false),
+		...(opts.remoteConnectionStatus ? { remoteConnectionStatus: observableValue('remoteConnectionStatus', opts.remoteConnectionStatus) } : {}),
 		isArchived: observableValue('isArchived', false),
 		isRead: observableValue('isRead', true),
 		lastTurnEnd: observableValue('lastTurnEnd', undefined),
 		description: observableValue('description', undefined),
 		chats: observableValue('chats', [chat]),
 		mainChat: constObservable(chat),
-		capabilities: { supportsMultipleChats: false },
+		capabilities: constObservable({ supportsMultipleChats: false }),
 	};
 }
 
@@ -76,6 +79,7 @@ suite('AgentHostSessionTaskRunner', () => {
 	let sentText: { text: string; shouldExecute: boolean }[];
 	let disposedTerminals: ITerminalInstance[];
 	let allTasks: ISessionTaskWithTarget[];
+	let resolverCalls: string[];
 	const fakeInstance = {
 		sendText: async (text: string, shouldExecute: boolean) => { sentText.push({ text, shouldExecute }); },
 		dispose: () => { disposedTerminals.push(fakeInstance); },
@@ -86,6 +90,7 @@ suite('AgentHostSessionTaskRunner', () => {
 		sentText = [];
 		disposedTerminals = [];
 		allTasks = [];
+		resolverCalls = [];
 
 		const instantiationService = store.add(new TestInstantiationService());
 
@@ -123,6 +128,16 @@ suite('AgentHostSessionTaskRunner', () => {
 		});
 
 		instantiationService.stub(ILogService, new NullLogService());
+		instantiationService.stub(IConfigurationResolverService, new class extends mock<IConfigurationResolverService>() {
+			override resolveAsync(folder: IWorkspaceFolderData | undefined, value: any): any {
+				resolverCalls.push(String(value));
+				return Promise.resolve(
+					typeof value === 'string' && folder
+						? value.replaceAll('${workspaceFolder}', folder.uri.path)
+						: value
+				);
+			}
+		});
 
 		runner = instantiationService.createInstance(AgentHostSessionTaskRunner);
 		// Reference unused imports to keep them in the bundle and silence linters.
@@ -147,6 +162,26 @@ suite('AgentHostSessionTaskRunner', () => {
 
 	test('canRun: true for remote agent host', () => {
 		assert.strictEqual(runner.canRun(makeSession({ providerId: 'agenthost-myhost' })), true);
+	});
+
+	test('does not run tasks for an unavailable remote agent host', async () => {
+		const session = makeSession({
+			providerId: 'agenthost-myhost',
+			cwd: toAgentHostUri(URI.file('/remote/worktree'), 'remote-agenthost-myhost'),
+			remoteConnectionStatus: { kind: 'disconnected', reason: SessionRemoteConnectionFailureReason.HostNotRunning },
+		});
+
+		const handle = await runner.runTask(shellTask(), session);
+
+		assert.deepStrictEqual({
+			canRun: runner.canRun(session),
+			handle,
+			createdTerminals,
+		}, {
+			canRun: false,
+			handle: undefined,
+			createdTerminals: [],
+		});
 	});
 
 	test('local agent-host sessions pass through file: cwd', async () => {
@@ -234,5 +269,43 @@ suite('AgentHostSessionTaskRunner', () => {
 
 		const expectedCommand = osToTaskTargetOS(OS) === 'windows' ? '.\\scripts\\code.bat' : './scripts/code.sh';
 		assert.deepStrictEqual(sentText, [{ text: `${expectedCommand} --agents`, shouldExecute: true }]);
+	});
+
+	test('expands ${workspaceFolder} to the session working directory', async () => {
+		const cwd = URI.file('/path/to/worktree');
+		const session = makeSession({ providerId: LOCAL_AGENT_HOST_PROVIDER_ID, cwd });
+		const task: ITaskEntry = {
+			label: 'Run Client',
+			type: 'shell',
+			command: './scripts/code.sh',
+			args: ['--user-data-dir=${workspaceFolder}/.profile-oss'],
+		};
+
+		(await runner.runTask(task, session))?.dispose();
+
+		assert.deepStrictEqual(sentText, [{
+			text: `./scripts/code.sh --user-data-dir=${cwd.path}/.profile-oss`,
+			shouldExecute: true,
+		}]);
+		assert.deepStrictEqual(resolverCalls, ['./scripts/code.sh', '--user-data-dir=${workspaceFolder}/.profile-oss']);
+	});
+
+	test('remote agent-host sessions expand ${workspaceFolder} from the POSIX host path without the renderer resolver', async () => {
+		const innerCwd = URI.file('/remote/worktree');
+		const session = makeSession({ providerId: 'agenthost-myhost', cwd: toAgentHostUri(innerCwd, 'remote') });
+		const task: ITaskEntry = {
+			label: 'Run Client',
+			type: 'shell',
+			command: './scripts/code.sh',
+			args: ['--user-data-dir=${workspaceFolder}/.profile-oss'],
+		};
+
+		(await runner.runTask(task, session))?.dispose();
+
+		assert.deepStrictEqual(sentText, [{
+			text: `./scripts/code.sh --user-data-dir=${innerCwd.path}/.profile-oss`,
+			shouldExecute: true,
+		}]);
+		assert.deepStrictEqual(resolverCalls, []);
 	});
 });

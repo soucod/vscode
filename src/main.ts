@@ -133,6 +133,7 @@ if (userLocale) {
 		userLocale,
 		osLocale,
 		commit: product.commit,
+		nlsMetadataHash: product.nlsMetadataHash,
 		userDataPath,
 		nlsMetadataPath: import.meta.dirname
 	});
@@ -332,8 +333,9 @@ function configureCommandlineSwitchesSync(cliArgs: NativeParsedArgs) {
 	// `DocumentPolicyIncludeJSCallStacksInCrashReports` - https://www.electronjs.org/docs/latest/api/web-frame-main#framecollectjavascriptcallstack-experimental
 	// `EarlyEstablishGpuChannel` - Refs https://issues.chromium.org/issues/40208065
 	// `EstablishGpuChannelAsync` - Refs https://issues.chromium.org/issues/40208065
+	// `GlobalShortcutsPortal` - Enables Electron's `globalShortcut` (system-wide keybindings) on Linux Wayland via the XDG global shortcuts portal (no-op elsewhere)
 	const featuresToEnable =
-		`NetAdapterMaxBufSizeFeature:NetAdapterMaxBufSize/8192,DocumentPolicyIncludeJSCallStacksInCrashReports,EarlyEstablishGpuChannel,EstablishGpuChannelAsync,${app.commandLine.getSwitchValue('enable-features')}`;
+		`NetAdapterMaxBufSizeFeature:NetAdapterMaxBufSize/8192,DocumentPolicyIncludeJSCallStacksInCrashReports,EarlyEstablishGpuChannel,EstablishGpuChannelAsync${process.platform === 'linux' ? ',GlobalShortcutsPortal' : ''},${app.commandLine.getSwitchValue('enable-features')}`;
 	app.commandLine.appendSwitch('enable-features', featuresToEnable);
 
 	// Following features are disabled from the runtime:
@@ -714,6 +716,7 @@ async function resolveNlsConfiguration(): Promise<INLSConfiguration> {
 		userLocale,
 		osLocale,
 		commit: product.commit,
+		nlsMetadataHash: product.nlsMetadataHash,
 		userDataPath,
 		nlsMetadataPath: import.meta.dirname
 	});
